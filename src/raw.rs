@@ -2772,7 +2772,28 @@ impl RawTableInner {
             None => return Err(fallibility.capacity_overflow()),
         };
         let full_capacity = bucket_mask_to_capacity(self.bucket_mask);
-        if new_items <= full_capacity / 2 {
+
+        let should_rehash_in_place = if new_items <= full_capacity / 2 {
+            true
+        } else {
+            // At high load we only rehash in-place if tombstones can satisfy
+            // the reserve pressure and still leave enough spare headroom.
+            let available_after_rehash = full_capacity - self.items;
+            let reclaimed_tombstones = available_after_rehash.saturating_sub(self.growth_left);
+            let needed_from_tombstones = additional.saturating_sub(self.growth_left);
+            let min_post_rehash_growth_left = usize::max(1, full_capacity / 16);
+
+            match full_capacity.checked_sub(new_items) {
+                Some(post_rehash_growth_left) => {
+                    needed_from_tombstones > 0
+                        && needed_from_tombstones <= reclaimed_tombstones
+                        && post_rehash_growth_left >= min_post_rehash_growth_left
+                }
+                None => false,
+            }
+        };
+
+        if should_rehash_in_place {
             // Rehash in-place without re-allocating if we have plenty of spare
             // capacity that is locked up due to DELETED entries.
 
@@ -4411,6 +4432,39 @@ mod test_map {
         }
     }
 
+    fn colliding_hash(_: &u64) -> u64 {
+        0
+    }
+
+    fn tombstones<T>(table: &RawTable<T>) -> usize {
+        let full_capacity = bucket_mask_to_capacity(table.table.bucket_mask);
+        full_capacity - table.table.items - table.table.growth_left
+    }
+
+    fn build_high_load_table_with_tombstones() -> RawTable<u64> {
+        let mut table = RawTable::with_capacity(512);
+
+        let full_capacity = table.capacity();
+        let insert_count = full_capacity - full_capacity / 8;
+        for i in 0..insert_count as u64 {
+            table.insert(0, i, colliding_hash);
+        }
+
+        let remove_start = insert_count / 4;
+        let remove_count = full_capacity / 4;
+        for i in 0..remove_count as u64 {
+            unsafe {
+                let key = (remove_start as u64) + i;
+                let bucket = table
+                    .find(0, |x| *x == key)
+                    .expect("expected key to be present before tombstone creation");
+                table.remove(bucket);
+            }
+        }
+
+        table
+    }
+
     #[test]
     fn rehash() {
         let mut table = RawTable::new();
@@ -4434,6 +4488,79 @@ mod test_map {
             }
             assert!(table.find(i + 100, |x| *x == i + 100).is_none());
         }
+    }
+
+    #[test]
+    fn reserve_rehash_adaptive_keeps_bucket_count_when_tombstones_can_absorb_growth() {
+        let mut table = build_high_load_table_with_tombstones();
+
+        let old_buckets = table.num_buckets();
+        let old_full_capacity = bucket_mask_to_capacity(table.table.bucket_mask);
+        let old_tombstones = tombstones(&table);
+        assert!(
+            old_tombstones >= old_full_capacity / 8,
+            "test precondition failed: expected enough tombstones, got {old_tombstones}, full_capacity={old_full_capacity}"
+        );
+
+        let additional = table.table.growth_left + 1;
+        let new_items = table.table.items + additional;
+        assert!(
+            new_items > old_full_capacity / 2,
+            "test precondition failed: expected high-load reserve path"
+        );
+
+        table.reserve(additional, colliding_hash);
+
+        assert_eq!(
+            table.num_buckets(),
+            old_buckets,
+            "adaptive in-place rehash should avoid resize when tombstones can absorb reserve"
+        );
+        assert!(
+            table.table.growth_left >= additional,
+            "reserve should provide at least requested growth_left after in-place rehash"
+        );
+    }
+
+    #[test]
+    fn reserve_rehash_adaptive_resizes_when_post_rehash_headroom_is_too_small() {
+        let mut table = build_high_load_table_with_tombstones();
+
+        let old_buckets = table.num_buckets();
+        let full_capacity = bucket_mask_to_capacity(table.table.bucket_mask);
+        let available_after_rehash = full_capacity - table.table.items;
+        let min_post_rehash_headroom = usize::max(1, full_capacity / 16);
+
+        let additional = available_after_rehash - (min_post_rehash_headroom - 1);
+        assert!(additional > table.table.growth_left);
+
+        table.reserve(additional, colliding_hash);
+
+        assert!(
+            table.num_buckets() > old_buckets,
+            "should resize when adaptive in-place rehash would leave too little headroom"
+        );
+    }
+
+    #[test]
+    fn reserve_rehash_adaptive_still_resizes_without_tombstones() {
+        let mut table = RawTable::with_capacity(256);
+        let full_capacity = table.capacity();
+
+        for i in 0..(full_capacity - full_capacity / 8) as u64 {
+            table.insert(0, i, colliding_hash);
+        }
+
+        assert_eq!(tombstones(&table), 0, "test precondition failed");
+
+        let old_buckets = table.num_buckets();
+        let additional = table.table.growth_left + 1;
+        table.reserve(additional, colliding_hash);
+
+        assert!(
+            table.num_buckets() > old_buckets,
+            "without tombstones we must grow to satisfy reserve"
+        );
     }
 
     /// CHECKING THAT WE ARE NOT TRYING TO READ THE MEMORY OF
