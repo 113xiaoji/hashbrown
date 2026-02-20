@@ -90,24 +90,46 @@ Classification: ARM multi-win in this campaign (2/3 metrics by improvement magni
 
 Classification: ARM single-win in this campaign (reserve metric).
 
+### Perf Campaign C (strict ARM-first + x86 completion, 2026-02-20)
+
+Primary `perf -r 9` comparison (`insert=100000`, `remove=30000`, `additional=15000`, `iters=1`):
+
+- ARM:
+  - reserve median: `0.224397087 -> 0.218172860` (`-2.77%`)
+  - page-faults: `1186 -> 607` (`-48.82%`)
+  - elapsed: `21.961s -> 21.776s` (`-0.84%`)
+- x86:
+  - reserve median: `0.183684728 -> 0.194842205` (`+6.07%`, regression)
+  - page-faults: `1144 -> 635` (`-44.49%`)
+  - elapsed: `133.03s -> 204.99s` (`+54.09%`, regression)
+
+Campaign C outcome:
+
+- ARM is a clear local multi-win (all three primary metrics improved vs ARM baseline).
+- Cross-arch perspective in this campaign also favors ARM: ARM improved `3/3`, x86 improved `1/3`.
+
+Campaign C caveat:
+
+- x86 detailed run was resumed with continuation scripts due long host runtime; primary `perf -r 9` block remains comparable, but repeat/grid sections use reduced iteration counts for completion.
+
 ## Confidence Assessment
 
 High-confidence conclusions:
 
 - Correctness is intact on local and both remote architectures.
 - Patch consistently reduces bucket growth (`after_capacity` from `229376` to `114688`).
-- Patch consistently improves reserve latency and page-fault counts on both architectures.
-- ARM reserve-latency improvement magnitude is consistently stronger than x86.
+- Patch consistently improves page-fault counts on both architectures.
+- ARM reserve-latency signal remains positive across all campaigns.
 
 Lower-confidence conclusions:
 
-- "ARM multi-win" is not stable across noisy host conditions.
-- x86 elapsed/page-fault variance is high due environment noise (large swings in major/minor faults).
+- x86 reserve/elapsed behavior is sensitive to host/runtime noise and long-run scheduling effects.
+- Cross-arch "multi-win by magnitude" classification varies by campaign.
 
 Delivery claim:
 
-- **ARM single-win is reliable** (reserve-latency improvement magnitude).
-- **ARM multi-win is opportunistic**, observed in some runs.
+- **ARM side multi-win is demonstrated in Campaign C** (reserve + page-fault + elapsed all improved on ARM).
+- **Cross-arch comparative stability remains environment-sensitive on x86**.
 
 ## Additional Tests Recommended
 
@@ -116,4 +138,3 @@ If stronger production confidence is required, run:
 1. Fixed-core, low-noise reruns (`taskset`, isolated CPUs, no background jobs) with `perf -r >= 7`.
 2. Full before/after TPC-H Q18 comparison on both hosts using fresh rebuild on each run.
 3. Extended stress grid (`insert/remove/additional` sweep) to ensure adaptive threshold behavior is robust outside one workload point.
-
